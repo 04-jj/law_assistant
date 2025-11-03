@@ -1,70 +1,20 @@
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
 from langchain_openai import ChatOpenAI
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores.faiss import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.documents import Document
 import os
 import requests
 import yaml
 import numpy as np
 from typing import List, Tuple
 from dotenv import load_dotenv
-from datetime import datetime
+
+from ConversationMemory import ConversationMemory
+from DocumentProcessor import DocumentProcessor
+from DocumentSplitter import GeneralDocumentSplitter
 
 load_dotenv()
-
-
-class ConversationMemory:
-    """对话记忆管理类"""
-
-    def __init__(self, max_history_turns: int = 5):
-        self.max_history_turns = max_history_turns
-        self.conversations = {}
-
-    def add_message(self, conversation_id: str, role: str, content: str):
-        """添加消息到对话历史"""
-        if conversation_id not in self.conversations:
-            self.conversations[conversation_id] = {
-                'history': [],
-                'created_at': datetime.now()
-            }
-
-        conversation = self.conversations[conversation_id]
-        conversation['history'].append({
-            'role': role,
-            'content': content,
-            'timestamp': datetime.now()
-        })
-
-        # 保留最近5轮对话
-        max_messages = self.max_history_turns * 2
-        if len(conversation['history']) > max_messages:
-            conversation['history'] = conversation['history'][-max_messages:]
-
-    def get_recent_history(self, conversation_id: str) -> List[dict]:
-        """获取最近的对话历史"""
-        if conversation_id not in self.conversations:
-            return []
-
-        return self.conversations[conversation_id]['history']
-
-    def get_formatted_history(self, conversation_id: str) -> str:
-        """获取格式化的对话历史"""
-        history = self.get_recent_history(conversation_id)
-        if not history:
-            return "无对话历史"
-
-        formatted = "最近的对话历史：\n"
-        for i, msg in enumerate(history):
-            speaker = "用户" if msg['role'] == 'user' else "助手"
-            formatted += f"{i + 1}. {speaker}: {msg['content']}\n"
-
-        return formatted
-
-    def clear_conversation(self, conversation_id: str):
-        """清空特定对话的记忆"""
-        if conversation_id in self.conversations:
-            del self.conversations[conversation_id]
 
 
 class DeepSeekApiRag:
@@ -80,8 +30,8 @@ class DeepSeekApiRag:
         embedding_model_name = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")
         self.embedding_model = HuggingFaceEmbeddings(
             model_name=embedding_model_name,
-            model_kwargs={'device': 'cuda'},  # 添加设备配置
-            encode_kwargs={'normalize_embeddings': True}  # 标准化嵌入
+            model_kwargs={'device': 'cuda'},
+            encode_kwargs={'normalize_embeddings': True}
         )
 
         # 2. 初始化DeepSeek API
@@ -98,18 +48,17 @@ class DeepSeekApiRag:
         # 3. 初始化向量数据库
         self.db_path = db_path
         self.vector_db = None
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=200,
-            chunk_overlap=20,
-            length_function=len
-        )
 
-        # 4. 初始化Reranker配置
+        # 4. 初始化文档处理器
+        self.document_processor = DocumentProcessor()
+        self.general_splitter = GeneralDocumentSplitter(chunk_size=200, chunk_overlap=20)
+
+        # 5. 初始化Reranker配置
         self.reranker_api_key = os.getenv("RERANKER_API_KEY")
         self.reranker_url = os.getenv("RERANKER_BASE_URL", "https://api.siliconflow.cn/v1/rerank")
         self.reranker_model = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 
-        # 5. 初始化记忆模块
+        # 6. 初始化记忆模块
         self.memory = ConversationMemory(max_history_turns=5)
 
         # 如果向量数据库已存在，直接加载
@@ -122,8 +71,6 @@ class DeepSeekApiRag:
     def _load_prompt(self, prompt_name: str = "legal_advisor_prompt") -> str:
         """从YAML文件加载提示词模板"""
         prompts_file = "prompts.yaml"
-
-        # 获取当前脚本目录
         current_dir = os.path.dirname(os.path.abspath(__file__))
         prompts_path = os.path.join(current_dir, prompts_file)
 
@@ -197,6 +144,7 @@ class DeepSeekApiRag:
             return [(doc, 0.0) for doc in documents[:top_k]]
 
     def add_documents(self, documents: List[str], save_to_disk: bool = True):
+        """添加文档到向量数据库"""
         if not documents:
             return
 
@@ -204,8 +152,6 @@ class DeepSeekApiRag:
 
         # 手动生成嵌入向量并确保是numpy数组格式
         embeddings = self.embedding_model.embed_documents(documents)
-
-        # 确保所有嵌入都是numpy数组
         embeddings_array = np.array(embeddings, dtype=np.float32)
 
         # 检查嵌入维度是否一致
@@ -214,7 +160,6 @@ class DeepSeekApiRag:
 
         if self.vector_db is None:
             # 使用FAISS.from_embeddings方法
-            from langchain_core.documents import Document
             docs = [Document(page_content=text) for text in documents]
 
             self.vector_db = FAISS.from_embeddings(
@@ -223,36 +168,65 @@ class DeepSeekApiRag:
                 metadatas=[{} for _ in documents]
             )
             print(f"FAISS 数据库已初始化，包含 {len(documents)} 个文档块。")
-        else:
-            # 使用add_embeddings方法
-            self.vector_db.add_embeddings(
-                text_embeddings=list(zip(documents, embeddings_array)),
-                metadatas=[{} for _ in documents]
-            )
-            print(f"FAISS 数据库已添加 {len(documents)} 个文档块。")
 
         if save_to_disk:
             self.save_vector_db()
 
     def add_file_documents(self, file_path: str, save_to_disk: bool = True):
-        # 支持TXT文件
+        """添加单个文件文档"""
+        print(f"正在处理文档: {file_path}")
+
+        try:
+            # 使用文档处理器自动识别类型并处理
+            structured_chunks = self.document_processor.process_document(file_path)
+
+            # 准备添加到向量数据库的文本
+            texts_to_add = []
+            for chunk in structured_chunks:
+                full_text = chunk['full_text']
+
+                # 如果是法律文档且条款过长，进行分块
+                if chunk.get('metadata', {}).get('source') == 'legal_document' and len(full_text) > 500:
+                    from DocumentSplitter import DocumentSplitter
+                    legal_splitter = DocumentSplitter(chunk_size=400, chunk_overlap=30)
+                    sub_chunks = legal_splitter.split_text(full_text)
+                    texts_to_add.extend(sub_chunks)
+                else:
+                    texts_to_add.append(full_text)
+
+            print(f"从文档中提取了 {len(structured_chunks)} 个结构化块，生成 {len(texts_to_add)} 个文本块")
+
+            # 添加到向量数据库
+            self.add_documents(texts_to_add, save_to_disk)
+
+        except Exception as e:
+            print(f"文档处理失败: {e}")
+            # 回退到普通分块
+            self._fallback_add_documents(file_path, save_to_disk)
+
+    def _fallback_add_documents(self, file_path: str, save_to_disk: bool = True):
+        """回退到普通分块策略"""
+        print(f"使用普通分块策略处理: {file_path}")
+
+        # 加载文档
         if file_path.lower().endswith('.pdf'):
             loader = PyPDFLoader(file_path)
         elif file_path.lower().endswith(('.doc', '.docx')):
             loader = Docx2txtLoader(file_path)
         elif file_path.lower().endswith('.txt'):
-            loader = TextLoader(file_path, encoding='utf-8')  # 处理TXT文件
+            loader = TextLoader(file_path, encoding='utf-8')
         else:
             print(f"不支持的文件格式: {file_path}")
             return
 
         pages = loader.load()
-        documents = self.text_splitter.split_documents(pages)
+        documents = self.general_splitter.split_documents(pages)
         texts = [doc.page_content for doc in documents]
         self.add_documents(texts, save_to_disk)
 
     def add_folder_documents(self, folder_path: str, save_to_disk: bool = True):
-        supported_extensions = ('.pdf', '.doc', '.docx', '.txt')  # TXT
+        """添加文件夹中的所有文档（自动识别类型）"""
+        supported_extensions = ('.pdf', '.doc', '.docx', '.txt')
 
         if not os.path.exists(folder_path):
             print(f"文件夹不存在: {folder_path}")
@@ -268,15 +242,19 @@ class DeepSeekApiRag:
             self.save_vector_db()
 
     def save_vector_db(self):
+        """保存向量数据库到本地"""
         if self.vector_db is not None:
             self.vector_db.save_local(self.db_path)
+            print(f"向量数据库已保存到: {self.db_path}")
 
     def load_vector_db(self):
+        """从本地加载向量数据库"""
         self.vector_db = FAISS.load_local(
             self.db_path,
             self.embedding_model,
             allow_dangerous_deserialization=True
         )
+        print(f"向量数据库已从 {self.db_path} 加载")
 
     def retrieve_documents(self, query: str, top_k: int = 3) -> List[Tuple[str, float]]:
         """检索 + 重排序"""
@@ -330,7 +308,7 @@ class DeepSeekApiRag:
         # 使用流式调用
         response_stream = self.llm.stream(prompt)
 
-        # 保存用户消息到记忆（如果是对话模式）
+        # 保存用户消息到记忆
         if conversation_id:
             self.memory.add_message(conversation_id, 'user', query)
 
@@ -349,3 +327,9 @@ class DeepSeekApiRag:
     def clear_conversation_memory(self, conversation_id: str):
         """清空特定对话的记忆"""
         self.memory.clear_conversation(conversation_id)
+
+    def get_document_count(self) -> int:
+        """获取向量数据库中的文档数量"""
+        if self.vector_db is None:
+            return 0
+        return self.vector_db.index.ntotal if hasattr(self.vector_db.index, 'ntotal') else 0
