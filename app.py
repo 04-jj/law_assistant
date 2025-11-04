@@ -124,6 +124,8 @@ def initialize_vector_database():
     if not os.path.exists(db_path):
         print("向量数据库不存在，开始构建...")
 
+        all_texts = []
+
         # 首先处理knowledge_base文件夹
         knowledge_base_folder = app.config['KNOWLEDGE_BASE_FOLDER']
         if os.path.exists(knowledge_base_folder) and os.listdir(knowledge_base_folder):
@@ -138,12 +140,9 @@ def initialize_vector_database():
             all_docs = UploadedDocument.query.all()
             if all_docs:
                 print("正在处理已上传的文档...")
-                # 收集所有文本一次性处理
-                all_texts = []
                 for doc in all_docs:
                     if os.path.exists(doc.file_path):
                         try:
-                            # 支持TXT文件
                             if doc.file_path.lower().endswith('.pdf'):
                                 loader = PyPDFLoader(doc.file_path)
                             elif doc.file_path.lower().endswith(('.doc', '.docx')):
@@ -165,6 +164,9 @@ def initialize_vector_database():
                 if all_texts:
                     rag_model.add_documents(all_texts)
                     print(f"已上传文档处理完成，共 {len(all_texts)} 个文本块")
+
+        print(f"向量数据库构建完成，总文档数: {rag_model.get_document_count()}")
+        print(f"BM25索引构建完成，总文档数: {rag_model.get_bm25_document_count()}")
     else:
         print("向量数据库已存在，跳过初始化构建")
 

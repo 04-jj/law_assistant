@@ -10,6 +10,7 @@ import numpy as np
 from typing import List, Tuple
 from dotenv import load_dotenv
 
+from BM25Retriever import BM25Retriever
 from ConversationMemory import ConversationMemory
 from DocumentProcessor import DocumentProcessor
 from DocumentSplitter import GeneralDocumentSplitter
@@ -49,24 +50,37 @@ class DeepSeekApiRag:
         self.db_path = db_path
         self.vector_db = None
 
-        # 4. 初始化文档处理器
+        # 4. 初始化BM25检索器
+        self.bm25_retriever = BM25Retriever("bm25_index.pkl")
+        self.all_documents = []  # 存储所有文档内容
+
+        # 5. 初始化文档处理器
         self.document_processor = DocumentProcessor()
         self.general_splitter = GeneralDocumentSplitter(chunk_size=200, chunk_overlap=20)
 
-        # 5. 初始化Reranker配置
+        # 6. 初始化Reranker配置
         self.reranker_api_key = os.getenv("RERANKER_API_KEY")
         self.reranker_url = os.getenv("RERANKER_BASE_URL", "https://api.siliconflow.cn/v1/rerank")
         self.reranker_model = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 
-        # 6. 初始化记忆模块
+        # 7. 初始化记忆模块
         self.memory = ConversationMemory(max_history_turns=5)
+
+        # 8. 检索权重配置
+        self.vector_weight = float(os.getenv("VECTOR_RETRIEVAL_WEIGHT", "0.6"))
+        self.bm25_weight = float(os.getenv("BM25_RETRIEVAL_WEIGHT", "0.4"))
 
         # 如果向量数据库已存在，直接加载
         if os.path.exists(db_path):
             print(f"加载已存在的向量数据库: {db_path}")
             self.load_vector_db()
+
+        # 尝试加载BM25索引
+        if not self.bm25_retriever.load_index():
+            print("BM25索引不存在，将在添加文档时构建")
         else:
-            print(f"向量数据库不存在，将在添加文档时创建: {db_path}")
+            self.all_documents = self.bm25_retriever.documents
+            print(f"BM25索引加载成功，文档数量: {len(self.all_documents)}")
 
     def _load_prompt(self, prompt_name: str = "legal_advisor_prompt") -> str:
         """从YAML文件加载提示词模板"""
@@ -108,7 +122,7 @@ class DeepSeekApiRag:
             self,
             query: str,
             documents: List[str],
-            top_k: int = 3
+            top_k: int = 10
     ) -> List[Tuple[str, float]]:
         if not self.reranker_api_key:
             print("未设置 Reranker API 密钥，跳过重排序")
@@ -144,7 +158,7 @@ class DeepSeekApiRag:
             return [(doc, 0.0) for doc in documents[:top_k]]
 
     def add_documents(self, documents: List[str], save_to_disk: bool = True):
-        """添加文档到向量数据库"""
+        """添加文档到向量数据库和BM25索引"""
         if not documents:
             return
 
@@ -168,9 +182,20 @@ class DeepSeekApiRag:
                 metadatas=[{} for _ in documents]
             )
             print(f"FAISS 数据库已初始化，包含 {len(documents)} 个文档块。")
+        else:
+            # 如果向量数据库已存在，添加新文档
+            self.vector_db.add_texts(documents, embeddings=embeddings_array)
+
+        # 添加到BM25索引
+        self.all_documents.extend(documents)
+        self.bm25_retriever.build_index(self.all_documents)
 
         if save_to_disk:
             self.save_vector_db()
+            self.bm25_retriever.save_index()
+
+        print(
+            f"文档添加完成 - 向量数据库: {self.get_document_count()} 个文档, BM25索引: {self.get_bm25_document_count()} 个文档")
 
     def add_file_documents(self, file_path: str, save_to_disk: bool = True):
         """添加单个文件文档"""
@@ -238,8 +263,9 @@ class DeepSeekApiRag:
                 print(f"正在处理文件: {file_path}")
                 self.add_file_documents(file_path, save_to_disk=False)
 
-        if save_to_disk and self.vector_db is not None:
+        if save_to_disk and (self.vector_db is not None or self.all_documents):
             self.save_vector_db()
+            self.bm25_retriever.save_index()
 
     def save_vector_db(self):
         """保存向量数据库到本地"""
@@ -256,22 +282,85 @@ class DeepSeekApiRag:
         )
         print(f"向量数据库已从 {self.db_path} 加载")
 
-    def retrieve_documents(self, query: str, top_k: int = 3) -> List[Tuple[str, float]]:
-        """检索 + 重排序"""
-        if self.vector_db is None:
-            raise ValueError("知识库中没有文档，请先添加文档")
+    def hybrid_retrieve_documents(self, query: str, top_k: int = 10) -> List[Tuple[str, float]]:
+        """混合检索：向量检索 + BM25检索"""
+        all_results = []
 
-        docs_and_scores = self.vector_db.similarity_search_with_score(query, k=10)
-        initial_docs = [doc.page_content for doc, _ in docs_and_scores]
+        # 1. 向量检索
+        try:
+            if self.vector_db is not None:
+                vector_results = self.vector_db.similarity_search_with_score(query, k=top_k * 2)
+                # 归一化向量检索分数
+                vector_scores = [score for _, score in vector_results]
+                if vector_scores:
+                    max_vector_score = max(vector_scores)
+                    min_vector_score = min(vector_scores)
+                    for doc, score in vector_results:
+                        if max_vector_score != min_vector_score:
+                            normalized_score = (score - min_vector_score) / (max_vector_score - min_vector_score)
+                        else:
+                            normalized_score = 1.0
+                        all_results.append((doc.page_content, normalized_score, "vector"))
+                    print(f"向量检索返回 {len(vector_results)} 个结果")
+        except Exception as e:
+            print(f"向量检索失败: {e}")
 
+        # 2. BM25检索
+        try:
+            bm25_results = self.bm25_retriever.search(query, top_k=top_k * 2)
+            # 归一化BM25分数
+            bm25_scores = [score for _, score in bm25_results]
+            if bm25_scores:
+                max_bm25_score = max(bm25_scores)
+                min_bm25_score = min(bm25_scores)
+                for doc, score in bm25_results:
+                    if max_bm25_score != min_bm25_score:
+                        normalized_score = (score - min_bm25_score) / (max_bm25_score - min_bm25_score)
+                    else:
+                        normalized_score = 1.0
+                    all_results.append((doc, normalized_score, "bm25"))
+                print(f"BM25检索返回 {len(bm25_results)} 个结果")
+        except Exception as e:
+            print(f"BM25检索失败: {e}")
+
+        # 3. 结果融合（加权融合）
+        fused_results = {}
+        for doc, score, method in all_results:
+            if doc not in fused_results:
+                # 根据方法类型应用不同权重
+                weight = self.vector_weight if method == "vector" else self.bm25_weight
+                fused_results[doc] = score * weight
+            else:
+                # 如果同一个文档被两种方法检索到，取加权平均
+                current_weight = self.vector_weight if method == "vector" else self.bm25_weight
+                fused_results[doc] = (fused_results[doc] + score * current_weight) / 2
+
+        # 4. 排序并返回top_k
+        sorted_results = sorted(fused_results.items(), key=lambda x: x[1], reverse=True)
+
+        final_results = [(doc, score) for doc, score in sorted_results[:top_k * 2]]
+        print(f"混合检索融合后返回 {len(final_results)} 个结果")
+
+        return final_results
+
+    def retrieve_documents(self, query: str, top_k: int = 10) -> List[Tuple[str, float]]:
+        """混合检索 + 重排序"""
+        # 使用混合检索获取更多候选文档
+        hybrid_results = self.hybrid_retrieve_documents(query, top_k=top_k * 2)
+
+        if not hybrid_results:
+            print("混合检索未返回任何结果")
+            return []
+
+        initial_docs = [doc for doc, _ in hybrid_results]
+
+        # 使用reranker进行精细排序
         reranked_docs = self._rerank_documents(query, initial_docs, top_k=top_k)
 
-        return [
-            (doc, next(score for d, score in docs_and_scores if d.page_content == doc))
-            for doc, _ in reranked_docs
-        ]
+        print(f"重排序后返回 {len(reranked_docs)} 个最终结果")
+        return reranked_docs
 
-    def generate_response_stream(self, query: str, conversation_id: str = None, top_k: int = 3,
+    def generate_response_stream(self, query: str, conversation_id: str = None, top_k: int = 20,
                                  prompt_name: str = "legal_advisor_prompt"):
         """生成RAG回答（带记忆）"""
         try:
@@ -333,3 +422,17 @@ class DeepSeekApiRag:
         if self.vector_db is None:
             return 0
         return self.vector_db.index.ntotal if hasattr(self.vector_db.index, 'ntotal') else 0
+
+    def get_bm25_document_count(self) -> int:
+        """获取BM25索引中的文档数量"""
+        return len(self.all_documents)
+
+    def get_retrieval_stats(self) -> dict:
+        """获取检索统计信息"""
+        return {
+            "vector_documents": self.get_document_count(),
+            "bm25_documents": self.get_bm25_document_count(),
+            "vector_weight": self.vector_weight,
+            "bm25_weight": self.bm25_weight,
+            "reranker_enabled": bool(self.reranker_api_key)
+        }
