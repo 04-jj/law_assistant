@@ -4,7 +4,7 @@ import re
 
 
 class DocumentSplitter(TextSplitter):
-    """专门用于法律文档的分块器，按条款分割"""
+    """文档分块，按条款分割"""
 
     def __init__(self, chunk_size: int = 500, chunk_overlap: int = 50):
         super().__init__(chunk_size=chunk_size, chunk_overlap=chunk_overlap)

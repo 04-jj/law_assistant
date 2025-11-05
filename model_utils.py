@@ -51,8 +51,7 @@ class DeepSeekApiRag:
         self.vector_db = None
 
         # 4. 初始化BM25检索器
-        self.bm25_retriever = BM25Retriever("bm25_index.pkl")
-        self.all_documents = []  # 存储所有文档内容
+        self.bm25_retriever = BM25Retriever("bm25_index.pkl", rebuild_threshold=50)
 
         # 5. 初始化文档处理器
         self.document_processor = DocumentProcessor()
@@ -76,11 +75,11 @@ class DeepSeekApiRag:
             self.load_vector_db()
 
         # 尝试加载BM25索引
+        # 尝试加载BM25索引
         if not self.bm25_retriever.load_index():
             print("BM25索引不存在，将在添加文档时构建")
         else:
-            self.all_documents = self.bm25_retriever.documents
-            print(f"BM25索引加载成功，文档数量: {len(self.all_documents)}")
+            print(f"BM25索引加载成功，文档数量: {self.bm25_retriever.get_document_count()}")
 
     def _load_prompt(self, prompt_name: str = "legal_advisor_prompt") -> str:
         """从YAML文件加载提示词模板"""
@@ -186,17 +185,15 @@ class DeepSeekApiRag:
             # 如果向量数据库已存在，添加新文档
             self.vector_db.add_texts(documents, embeddings=embeddings_array)
 
-        # 添加到BM25索引
-        self.all_documents.extend(documents)
-        self.bm25_retriever.build_index(self.all_documents)
+        # 使用增量添加
+        self.bm25_retriever.add_documents(documents)
 
         if save_to_disk:
             self.save_vector_db()
             self.bm25_retriever.save_index()
 
         print(
-            f"文档添加完成 - 向量数据库: {self.get_document_count()} 个文档, BM25索引: {self.get_bm25_document_count()} 个文档")
-
+            f"文档添加完成 - 向量数据库: {self.get_document_count()} 个文档, BM25索引: {self.bm25_retriever.get_document_count()} 个文档")
     def add_file_documents(self, file_path: str, save_to_disk: bool = True):
         """添加单个文件文档"""
         print(f"正在处理文档: {file_path}")
@@ -257,13 +254,19 @@ class DeepSeekApiRag:
             print(f"文件夹不存在: {folder_path}")
             return
 
+        file_count = 0
         for filename in os.listdir(folder_path):
             if filename.lower().endswith(supported_extensions):
                 file_path = os.path.join(folder_path, filename)
                 print(f"正在处理文件: {file_path}")
                 self.add_file_documents(file_path, save_to_disk=False)
+                file_count += 1
 
-        if save_to_disk and (self.vector_db is not None or self.all_documents):
+        # 在处理完所有文件后，强制重建一次BM25索引以确保数据同步
+        if file_count > 0:
+            self.bm25_retriever.force_rebuild()
+
+        if save_to_disk and (self.vector_db is not None or self.bm25_retriever.get_document_count() > 0):
             self.save_vector_db()
             self.bm25_retriever.save_index()
 
@@ -425,13 +428,15 @@ class DeepSeekApiRag:
 
     def get_bm25_document_count(self) -> int:
         """获取BM25索引中的文档数量"""
-        return len(self.all_documents)
+        return self.bm25_retriever.get_document_count()
 
     def get_retrieval_stats(self) -> dict:
         """获取检索统计信息"""
         return {
             "vector_documents": self.get_document_count(),
-            "bm25_documents": self.get_bm25_document_count(),
+            "bm25_documents": self.bm25_retriever.get_document_count(),
+            "bm25_indexed_documents": self.bm25_retriever.get_indexed_count(),
+            "bm25_pending_documents": self.bm25_retriever.get_pending_count(),
             "vector_weight": self.vector_weight,
             "bm25_weight": self.bm25_weight,
             "reranker_enabled": bool(self.reranker_api_key)

@@ -13,12 +13,11 @@ from werkzeug.security import generate_password_hash, check_password_hash
 load_dotenv()
 
 app = Flask(__name__)
-app.config['TEMPLATES_AUTO_RELOAD'] = True
 app.config['SECRET_KEY'] = os.urandom(24)
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///user.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['UPLOAD_FOLDER'] = os.path.join(app.root_path, 'uploads')
-app.config['KNOWLEDGE_BASE_FOLDER'] = os.path.join(app.root_path, 'knowledge_base')  # 新增知识库文件夹配置
+app.config['KNOWLEDGE_BASE_FOLDER'] = os.path.join(app.root_path, 'knowledge_base')
 app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
 
 # 确保上传文件夹和知识库文件夹存在
@@ -109,6 +108,7 @@ def load_user(user_id):
 
 
 # 初始化 RAG 模型
+# api_key = os.getenv("LOCAL_MODEL_PATH")
 api_key = os.getenv("DEEPSEEK_API_KEY")
 db_path = os.getenv("VECTOR_DB_PATH", "law_faiss")
 
@@ -455,11 +455,11 @@ def delete_uploaded_document(doc_id):
     return redirect(url_for('upload_document'))
 
 
-# 修改后的流式对话路由（带记忆功能）
+# 流式对话路由
 @app.route('/ask_stream', methods=['POST', 'GET'])
 @login_required
 def ask_stream():
-    """专门的流式对话接口（带记忆）"""
+    """专门的流式对话接口"""
     # 处理参数
     if request.method == 'GET':
         user_input = request.args.get('user_input')
@@ -473,7 +473,7 @@ def ask_stream():
     if not user_input or not chat_id:
         return jsonify({'error': '缺少必要参数'}), 400
 
-    print(f"用户提问(流式): {user_input}")
+    print(f"用户提问: {user_input}")
 
     # 使用chat_id作为对话记忆的标识
     conversation_id = f"chat_{chat_id}"
