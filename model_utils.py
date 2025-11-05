@@ -9,11 +9,10 @@ import yaml
 import numpy as np
 from typing import List, Tuple
 from dotenv import load_dotenv
-
+from DocumentSplitter import DocumentSplitter, GeneralDocumentSplitter
 from BM25Retriever import BM25Retriever
 from ConversationMemory import ConversationMemory
 from DocumentProcessor import DocumentProcessor
-from DocumentSplitter import GeneralDocumentSplitter
 
 load_dotenv()
 
@@ -209,7 +208,6 @@ class DeepSeekApiRag:
 
                 # 如果是法律文档且条款过长，进行分块
                 if chunk.get('metadata', {}).get('source') == 'legal_document' and len(full_text) > 500:
-                    from DocumentSplitter import DocumentSplitter
                     legal_splitter = DocumentSplitter(chunk_size=400, chunk_overlap=30)
                     sub_chunks = legal_splitter.split_text(full_text)
                     texts_to_add.extend(sub_chunks)
@@ -247,7 +245,7 @@ class DeepSeekApiRag:
         self.add_documents(texts, save_to_disk)
 
     def add_folder_documents(self, folder_path: str, save_to_disk: bool = True):
-        """添加文件夹中的所有文档（自动识别类型）"""
+        """添加文件夹中的所有文档"""
         supported_extensions = ('.pdf', '.doc', '.docx', '.txt')
 
         if not os.path.exists(folder_path):
@@ -262,7 +260,7 @@ class DeepSeekApiRag:
                 self.add_file_documents(file_path, save_to_disk=False)
                 file_count += 1
 
-        # 在处理完所有文件后，强制重建一次BM25索引以确保数据同步
+        # 重建一次BM25索引
         if file_count > 0:
             self.bm25_retriever.force_rebuild()
 

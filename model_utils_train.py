@@ -439,7 +439,7 @@ class LocalRagSystem:
         except Exception as e:
             print(f"BM25检索失败: {e}")
 
-        # 3. 结果融合（加权融合）
+        # 3. 混合
         fused_results = {}
         for doc, score, method in all_results:
             if doc not in fused_results:
