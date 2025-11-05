@@ -1,5 +1,4 @@
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
-from langchain_openai import ChatOpenAI
 from langchain_community.vectorstores.faiss import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.documents import Document
@@ -7,8 +6,19 @@ import os
 import requests
 import yaml
 import numpy as np
-from typing import List, Tuple
+from typing import List, Tuple, Iterator
 from dotenv import load_dotenv
+
+# 导入transformers相关库
+try:
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer
+    from threading import Thread
+
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    TRANSFORMERS_AVAILABLE = False
+    print("警告: transformers库未安装，无法使用本地模型")
 
 from BM25Retriever import BM25Retriever
 from ConversationMemory import ConversationMemory
@@ -18,11 +28,120 @@ from DocumentSplitter import GeneralDocumentSplitter
 load_dotenv()
 
 
-class DeepSeekApiRag:
-    def __init__(self, api_key: str = None, db_path: str = None):
-        # 从环境变量获取配置，如果参数为None则使用环境变量
-        if api_key is None:
-            api_key = os.getenv("DEEPSEEK_API_KEY")
+class LocalModel:
+    """本地模型包装器"""
+
+    def __init__(self, model_path: str, device: str = "cuda"):
+        if not TRANSFORMERS_AVAILABLE:
+            raise ImportError("transformers库未安装，请运行: pip install transformers")
+
+        self.model_path = model_path
+        self.device = device
+
+        print(f"正在加载本地模型: {model_path}")
+
+        # 加载tokenizer和模型
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=True
+        )
+
+        # 如果tokenizer没有pad_token，设置为eos_token
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # 根据设备选择加载方式
+        if device == "cuda" and torch.cuda.is_available():
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                trust_remote_code=True,
+                low_cpu_mem_usage=True
+            )
+            print("模型运行在GPU模式")
+        # else:
+        #     self.model = AutoModelForCausalLM.from_pretrained(
+        #         model_path,
+        #         torch_dtype=torch.float32,
+        #         device_map=None,
+        #         trust_remote_code=True
+        #     )
+        #     self.model = self.model.to('cpu')
+        #     print("模型运行在CPU模式")
+
+        self.model.eval()  # 设置为评估模式
+        print("本地模型加载完成")
+
+    def stream_chat(self, prompt: str, max_new_tokens: int = 512, temperature: float = 0.7) -> Iterator[str]:
+        """流式生成回复"""
+        # 编码输入
+        inputs = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=2048,
+            padding=True
+        )
+
+        # 移动输入到设备
+        device = next(self.model.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        # 创建流式生成器
+        streamer = TextIteratorStreamer(
+            self.tokenizer,
+            timeout=60.0,
+            skip_prompt=True,
+            skip_special_tokens=True
+        )
+
+        # 生成参数
+        generation_kwargs = {
+            **inputs,
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "do_sample": temperature > 0,
+            "top_p": 0.9,
+            "streamer": streamer,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "repetition_penalty": 1.1
+        }
+
+        # 在单独线程中生成
+        thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
+        thread.daemon = True
+        thread.start()
+
+        # 流式返回结果
+        generated_text = ""
+        for new_text in streamer:
+            generated_text += new_text
+            yield new_text
+
+
+class LocalModelWrapper:
+    """本地模型包装器，模拟ChatOpenAI接口"""
+
+    def __init__(self, model_path: str, device: str = "cuda"):
+        self.model = LocalModel(model_path, device)
+
+    def stream(self, prompt: str):
+        """流式生成，模拟ChatOpenAI的stream方法"""
+
+        class StreamResponse:
+            def __init__(self, content):
+                self.content = content
+                self.type = "content"
+
+        for chunk in self.model.stream_chat(prompt, max_new_tokens=512, temperature=0.7):
+            yield StreamResponse(chunk)
+
+
+class LocalRagSystem:
+    def __init__(self, db_path: str = None):
+        # 从环境变量获取配置
         if db_path is None:
             db_path = os.getenv("VECTOR_DB_PATH", "law_faiss")
 
@@ -31,20 +150,23 @@ class DeepSeekApiRag:
         embedding_model_name = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")
         self.embedding_model = HuggingFaceEmbeddings(
             model_name=embedding_model_name,
-            model_kwargs={'device': 'cuda'},
+            model_kwargs={'device': 'cuda' if torch.cuda.is_available() else 'cpu'},
             encode_kwargs={'normalize_embeddings': True}
         )
 
-        # 2. 初始化DeepSeek API
-        print("正在初始化DeepSeek API...")
-        deepseek_base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
-        deepseek_model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+        # 2. 初始化本地大语言模型
+        local_model_path = os.getenv("LOCAL_MODEL_PATH")
+        local_device = os.getenv("LOCAL_MODEL_DEVICE", "cuda")
 
-        self.llm = ChatOpenAI(
-            api_key=api_key,
-            base_url=deepseek_base_url,
-            model=deepseek_model,
-        )
+        if not local_model_path:
+            raise ValueError("请设置 LOCAL_MODEL_PATH 环境变量指定本地模型路径")
+
+        print("正在初始化本地模型...")
+        try:
+            self.llm = LocalModelWrapper(local_model_path, local_device)
+            print("本地模型初始化成功")
+        except Exception as e:
+            raise RuntimeError(f"本地模型初始化失败: {e}")
 
         # 3. 初始化向量数据库
         self.db_path = db_path
@@ -394,8 +516,17 @@ class DeepSeekApiRag:
             conversation_history=conversation_history
         )
 
-        # 使用流式调用
-        response_stream = self.llm.stream(prompt)
+        # 使用本地模型流式调用
+        try:
+            response_stream = self.llm.stream(prompt)
+        except Exception as e:
+            print(f"本地模型调用失败: {e}")
+
+            # 返回错误响应
+            def error_stream():
+                yield "抱歉，本地模型调用出现错误，请检查模型路径和设备配置。"
+
+            response_stream = error_stream()
 
         # 保存用户消息到记忆
         if conversation_id:
